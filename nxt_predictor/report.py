@@ -92,7 +92,8 @@ def _svg_chart(closes: pd.Series, p: Prediction, w: int = 760, h: int = 300) -> 
 
 
 def html_report(
-    ticker: str, p: Prediction, daily: pd.DataFrame, intraday: dict, news: pd.DataFrame, po: Prediction | None = None
+    ticker: str, p: Prediction, daily: pd.DataFrame, intraday: dict, news: pd.DataFrame, po: Prediction | None = None,
+    extra: str = "",
 ) -> str:
     bt = p.backtest
     sign = "up" if p.predicted_return > 0 else "down"
@@ -152,5 +153,101 @@ td:first-child{{white-space:nowrap;color:var(--muted)}} ul{{padding-left:18px}}
 <div class="s">Обучено на {p.n_train_days} днях, {p.n_features} признаков. Гиперпараметры подобраны на данных до периода проверки.</div>
 <table>{models}</table>
 <h2>Что влияет сильнее всего</h2><ul>{feats}</ul>
+{extra}
 <h2>Новости и тональность</h2><table>{news_rows}</table>
 </main></body></html>"""
+
+
+def _pct(v: float) -> str:
+    return "—" if pd.isna(v) else f"{v * 100:+.1f}%"
+
+
+def next_day_tags(next_day: pd.Timestamp) -> list[str]:
+    """К каким календарным группам относится прогнозируемый день."""
+    tags = []
+    if next_day.day == 30:
+        tags.append("30-е число")
+    if next_day.day == 1:
+        tags.append("1-е число")
+    nb = next_day + pd.offsets.BDay()
+    if nb.month != next_day.month:
+        tags.append("последний день месяца")
+        if next_day.month in (3, 6, 9, 12):
+            tags.append("конец квартала")
+    pb = next_day - pd.offsets.BDay()
+    if pb.month != next_day.month:
+        tags.append("первый день месяца")
+        if next_day.month in (1, 4, 7, 10):
+            tags.append("начало квартала")
+    return tags
+
+
+def events_text(next_day: pd.Timestamp, cal: pd.DataFrame, scen: dict | None) -> str:
+    lines = ["", f"=== Особенности дня {next_day:%Y-%m-%d} ==="]
+    tags = next_day_tags(next_day)
+    for t in tags:
+        r = cal.loc[t]
+        lines.append(f"  {t}: рост в {r['доля роста']:.0%} из {r['дней']} дней, медиана {_pct(r['медиана'])}"
+                     f" (обычный день {_pct(r['прочие дни'])}), p≈{r['p (случайность)']:.2f}")
+    if not tags:
+        lines.append("  обычный день календаря")
+    if any(r["p (случайность)"] < 0.05 for _, r in cal.iterrows()):
+        lines.append("  есть статистически значимые календарные эффекты (p<0.05)")
+    else:
+        lines.append("  календарные эффекты NXT статистически не доказаны (все p ≥ 0.05) — модель их не учитывает")
+    if scen:
+        h = scen["history"]
+        pc = scen["prev_close"]
+        lines += ["", f"!!! Следующий день — ПОСЛЕ ОТЧЁТА КОМПАНИИ. Обычная модель тут не работает.",
+                  f"  История ({h['n']} отчётов): рост в {h['up_share']:.0%}, к закрытию откат от открытия в {h['fade_share']:.0%}",
+                  f"  Открытие (25/50/75%): " + " / ".join(f"${v:.2f}" for v in h["open_q"].values()),
+                  f"  Закрытие (25/50/75%): " + " / ".join(f"${v:.2f}" for v in h["close_q"].values()),
+                  f"  Похожие по картине перед отчётом: открытие ~${scen['similar_open']:.2f}, закрытие ~${scen['similar_close']:.2f}"]
+        for x, r in scen["similar"].iterrows():
+            lines.append(f"    {x:%Y-%m-%d}: гэп {_pct(r['gap'])}, итог {_pct(r['ret'])} → открытие ${pc * (1 + r['gap']):.2f},"
+                         f" закрытие ${pc * (1 + r['ret']):.2f}")
+        a = scen.get("after_hours")
+        if a:
+            lines += [f"  After hours ${a['price']:.2f} ({_pct(a['pct'])}), по {a['n']} известным случаям:",
+                      f"    открытие ~${a['open']['mid']:.2f} (${a['open']['lo']:.2f}–{a['open']['hi']:.2f}), связь r={a['open']['corr']:.2f}",
+                      f"    закрытие ~${a['close']['mid']:.2f} (${a['close']['lo']:.2f}–{a['close']['hi']:.2f}), связь r={a['close']['corr']:.2f}"]
+            for x, r in a["nearest"].iterrows():
+                lines.append(f"    похожий after hours {x:%Y-%m-%d}: AH {_pct(r['after_hours'])} → гэп {_pct(r['gap'])}, итог {_pct(r['ret'])}")
+    return "\n".join(lines)
+
+
+def events_html(cal: pd.DataFrame, reactions: pd.DataFrame, qturn: pd.DataFrame, scen: dict | None) -> str:
+    cal_rows = "".join(
+        f"<tr><td>{html.escape(n)}</td><td>{int(r['дней'])}</td><td>{r['доля роста']:.0%}</td><td>{_pct(r['медиана'])}</td>"
+        f"<td>{_pct(r['прочие дни'])}</td><td class='s'>{r['p (случайность)']:.2f}</td></tr>"
+        for n, r in cal.iterrows()
+    )
+    if reactions.empty:
+        reactions = pd.DataFrame(columns=["after_hours", "gap", "intra", "ret", "week"])
+    rx_rows = "".join(
+        f"<tr><td>{x:%Y-%m-%d}</td><td>{_pct(r['after_hours'])}</td><td>{_pct(r['gap'])}</td><td>{_pct(r['intra'])}</td>"
+        f"<td class='{'up' if r['ret'] > 0 else 'down'}'>{_pct(r['ret'])}</td><td>{_pct(r['week'])}</td></tr>"
+        for x, r in reactions.iloc[::-1].iterrows()
+    )
+    q_rows = "".join(
+        f"<tr><td>{x:%Y-%m-%d}</td><td class='{'up' if r['итог дня'] > 0 else 'down'}'>{_pct(r['итог дня'])}</td>"
+        f"<td>{_pct(r['след. день'])}</td></tr>"
+        for x, r in qturn.iloc[::-1].iterrows()
+    )
+    block = ""
+    if scen:
+        h = scen["history"]
+        block = (f"<div class='card' style='margin-top:16px'><b>Следующий день — после отчёта компании.</b> "
+                 f"По {h['n']} прошлым отчётам: открытие ~${h['open_q'][0.5]:.2f}, закрытие ~${h['close_q'][0.5]:.2f}; "
+                 f"похожие случаи: ${scen['similar_open']:.2f} / ${scen['similar_close']:.2f}.")
+        if scen.get("after_hours"):
+            a = scen["after_hours"]
+            block += (f" С учётом after hours ${a['price']:.2f}: открытие ~${a['open']['mid']:.2f}, "
+                      f"закрытие ~${a['close']['mid']:.2f} (${a['close']['lo']:.2f}–{a['close']['hi']:.2f}).")
+        block += "</div>"
+    return f"""{block}
+<h2>Календарь</h2><div class="s">p — вероятность получить такую долю роста случайно; эффект надёжен при p&lt;0.05.</div>
+<table><tr><td></td><td>дней</td><td>рост</td><td>медиана</td><td>обычный день</td><td>p</td></tr>{cal_rows}</table>
+<h2>Реакция на отчёты компании</h2><div class="s">День после отчёта: after hours, гэп на открытии, движение внутри дня, итог, неделя.</div>
+<table><tr><td></td><td>AH</td><td>гэп</td><td>внутри дня</td><td>итог</td><td>неделя</td></tr>{rx_rows}</table>
+<h2>Конец квартала → следующий день</h2><table>{q_rows}</table>"""

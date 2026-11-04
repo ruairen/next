@@ -121,7 +121,7 @@ def build_features(
     f["money_flow_5"] = (clv * v).rolling(5).sum() / v.rolling(5).sum()
     f["obv_slope"] = (np.sign(logret) * v).rolling(10).sum() / v.rolling(10).sum()
 
-    f["dow"] = daily.index.dayofweek / 4
+    f["dow"] = daily.index.day_of_week / 4
     for n in (5, 20):
         f[f"up_share_{n}"] = (logret > 0).rolling(n).mean()
     f["skew_20"] = logret.rolling(20).skew()

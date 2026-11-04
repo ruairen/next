@@ -118,3 +118,62 @@ def test_open_target_is_gap_to_next_open():
     expected = np.log(daily["Open"].iloc[1] / daily["Close"].iloc[0])
     assert abs(f["target"].iloc[0] - expected) < 1e-12
     assert np.isnan(f["target"].iloc[-1])
+
+
+def _nxt_like_daily():
+    """Синтетика с датами реальных отчётов NXT и сильными реакциями в эти дни."""
+    from nxt_predictor import events
+
+    idx = pd.bdate_range("2023-02-09", "2026-10-28")
+    rng = np.random.default_rng(3)
+    ret = rng.normal(0.0005, 0.03, len(idx))
+    for i, x in enumerate(idx):
+        if str(x.date()) in events.EARNINGS_REACTION_DAYS:
+            ret[i] = 0.10
+    close = 40 * np.exp(np.cumsum(ret))
+    open_ = close / np.exp(ret) * np.exp(np.where(ret == 0.10, 0.08, 0.0))
+    return pd.DataFrame({"Open": open_, "High": np.maximum(open_, close) * 1.01,
+                         "Low": np.minimum(open_, close) * 0.99, "Close": close,
+                         "Volume": rng.lognormal(14, 0.3, len(idx))}, index=idx.rename("Date"))
+
+
+def test_calendar_ignores_unfinished_month_at_end():
+    from nxt_predictor import events
+
+    daily = _nxt_like_daily().loc[:"2026-09-29"]  # сентябрь не закончен
+    qt = events.quarter_turn(daily)
+    assert pd.Timestamp("2026-09-29") not in qt.index
+    assert pd.Timestamp("2026-06-30") in qt.index
+    cal = events.calendar_stats(daily)
+    assert {"30-е число", "конец квартала", "начало квартала"} <= set(cal.index)
+    assert ((cal["p (случайность)"] > 0) & (cal["p (случайность)"] <= 1)).all()
+
+
+def test_earnings_reactions_and_scenarios():
+    from nxt_predictor import events
+
+    daily = _nxt_like_daily()
+    rx = events.earnings_reactions(daily)
+    assert pd.Timestamp("2024-08-02") in rx.index and pd.Timestamp("2024-07-31") not in rx.index
+    assert np.allclose(rx["ret"], np.expm1(0.10))
+    assert rx["after_hours"].notna().sum() >= 10
+    pc = float(daily["Close"].iloc[-1])
+    scen = events.earnings_scenarios(rx, pc, events.current_setup(daily), after_hours=pc * 1.10)
+    assert abs(scen["history"]["close_q"][0.5] / pc - np.exp(0.10)) < 1e-9
+    assert len(scen["similar"]) == 6
+    a = scen["after_hours"]
+    assert a["open"]["lo"] <= a["open"]["mid"] <= a["open"]["hi"]
+    assert abs(a["pct"] - 0.10) < 1e-12
+
+
+def test_cli_earnings_day_with_after_hours(tmp_path):
+    daily = _nxt_like_daily()
+    daily.to_csv(tmp_path / "p.csv")
+    news = pd.DataFrame({"time": [], "title": []})
+    news.to_csv(tmp_path / "n.csv", index=False)
+    assert main(["--prices-csv", str(tmp_path / "p.csv"), "--news-csv", str(tmp_path / "n.csv"),
+                 "--context", "none", "--fast", "--backtest-days", "40",
+                 "--after-hours", str(float(daily["Close"].iloc[-1]) * 1.05), "--out", str(tmp_path)]) == 0
+    summary = json.loads((tmp_path / "NXT_prediction.json").read_text(encoding="utf-8"))
+    assert summary["earnings_day"]["after_hours"]["pct"] > 0.04
+    assert "Реакция на отчёты компании" in (tmp_path / "NXT_report.html").read_text(encoding="utf-8")

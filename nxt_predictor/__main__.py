@@ -10,8 +10,9 @@ import pandas as pd
 
 from . import data
 from .features import build_features, intraday_summary, score_news
+from . import events
 from .model import predict_next
-from .report import html_report, text_report
+from .report import events_html, events_text, html_report, text_report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +29,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prices-csv", help="свои дневные цены (Date,Open,High,Low,Close,Volume)")
     ap.add_argument("--news-csv", help="свои новости (time,title[,summary])")
     ap.add_argument("--out", default="output", help="папка для отчётов")
+    ap.add_argument("--earnings-day", action="store_true",
+                    help="следующая сессия — день после отчёта компании (определяется и автоматически)")
+    ap.add_argument("--after-hours", type=float, metavar="PRICE",
+                    help="цена в after hours / премаркете после отчёта — уточняет сценарий открытия и закрытия")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s: %(message)s")
 
@@ -56,11 +61,24 @@ def main(argv: list[str] | None = None) -> int:
                              backtest_days=args.backtest_days, fast=args.fast)
     intra = intraday_summary(intraday)
 
+    next_day = daily.index[-1].normalize() + pd.offsets.BDay()
+    cal, qturn = events.calendar_stats(daily), events.quarter_turn(daily)
+    # Даты отчётов известны только для NXT; для других тикеров раздел про отчёты пустой.
+    reactions = events.earnings_reactions(daily) if args.ticker.upper() == "NXT" else pd.DataFrame()
+    scen = None
+    want = args.earnings_day or args.after_hours or str(next_day.date()) in events.EARNINGS_REACTION_DAYS
+    if want and len(reactions) < 5:
+        logging.warning("Мало данных об отчётах (%d) — сценарий дня после отчёта не построен", len(reactions))
+    elif want:
+        scen = events.earnings_scenarios(reactions, last_close, events.current_setup(daily), args.after_hours)
+
     print(text_report(args.ticker, pred, intra, news, pred_open))
+    print(events_text(next_day, cal, scen))
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.ticker}_report.html").write_text(html_report(args.ticker, pred, daily, intra, news, pred_open), encoding="utf-8")
+    (out / f"{args.ticker}_report.html").write_text(html_report(args.ticker, pred, daily, intra, news, pred_open,
+                                                                           events_html(cal, reactions, qturn, scen)), encoding="utf-8")
     summary = {k: v for k, v in pred.__dict__.items() if k != "backtest"}
     summary["backtest"] = {k: v for k, v in pred.backtest.items() if k != "series"}
     summary["intraday"] = intra
@@ -71,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
         "predicted_return": pred_open.predicted_return,
         "backtest": {k: v for k, v in pred_open.backtest.items() if k != "series"},
     }
+    if scen:
+        summary["earnings_day"] = {
+            "similar_open": scen["similar_open"], "similar_close": scen["similar_close"],
+            "history_close_median": scen["history"]["close_q"][0.5],
+            **({"after_hours": {k: scen["after_hours"][k] for k in ("price", "pct", "open", "close")}}
+               if scen.get("after_hours") else {}),
+        }
     (out / f"{args.ticker}_prediction.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nОтчёт: {out / f'{args.ticker}_report.html'}")
     return 0
