@@ -87,6 +87,8 @@ def build_features(
     news: pd.DataFrame | None = None,
     context: pd.DataFrame | None = None,
     target: str = "close",
+    skip_target_days: list | None = None,
+    min_news_coverage: float = 0.1,
 ) -> pd.DataFrame:
     """Таблица признаков на каждый торговый день + целевая переменная target:
     лог-доходность от сегодняшнего закрытия до закрытия (target="close")
@@ -132,12 +134,21 @@ def build_features(
         f = f.join(context_features(daily, context))
 
     news_f = daily_news_features(news if news is not None else pd.DataFrame(columns=["time", "title", "summary"]), daily.index)
-    f = f.join(news_f)
-    f["news_sent_3d"] = f["news_sent"].rolling(3, min_periods=1).mean()
-    f["news_count_5d"] = f["news_count"].rolling(5, min_periods=1).sum()
+    # Бесплатные ленты отдают новости только за последние недели. Если новости есть меньше
+    # чем в min_news_coverage дней истории, для обучения это шум — признаки не добавляем
+    # (на проверке NXT без них точнее). Новости при этом остаются в отчёте.
+    if (news_f["news_count"] > 0).mean() >= min_news_coverage:
+        f = f.join(news_f)
+        f["news_sent_3d"] = f["news_sent"].rolling(3, min_periods=1).mean()
+        f["news_count_5d"] = f["news_count"].rolling(5, min_periods=1).sum()
 
     nxt = o.shift(-1) if target == "open" else c.shift(-1)
     f["target"] = np.log(nxt / c)
+    if skip_target_days is not None:
+        # Дни после отчётов (±10–25%) не учим и не проверяем: их оценивает events.py,
+        # а обычной модели они только портят обучение.
+        next_day = pd.Series(daily.index, index=daily.index).shift(-1)
+        f.loc[next_day.isin(pd.to_datetime(list(skip_target_days))).to_numpy(), "target"] = np.nan
     return f.replace([np.inf, -np.inf], np.nan)
 
 

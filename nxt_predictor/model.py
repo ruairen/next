@@ -23,6 +23,42 @@ from sklearn.preprocessing import StandardScaler
 log = logging.getLogger(__name__)
 
 QUANTILES = (0.1, 0.9)
+WINSOR = 0.02  # доля хвостов цели, обрезаемых при обучении
+
+
+def _clip(y: pd.Series) -> pd.Series:
+    """Обрезает редкие экстремальные дни, чтобы они не перетягивали обучение."""
+    return y.clip(y.quantile(WINSOR), y.quantile(1 - WINSOR))
+
+
+def calibrated_range(daily: pd.DataFrame, target: str = "close", level: float = 0.8,
+                     skip_target_days: list | None = None, window: int = 250) -> dict:
+    """Диапазон доходности следующего дня с честным покрытием.
+
+    Доходности делятся на текущую волатильность (20 дней), берутся квантили за
+    последние `window` обычных дней и умножаются на сегодняшнюю волатильность.
+    Ширина подстраивается: выбирается самый узкий вариант, который на последних
+    `window` днях (без заглядывания в будущее) накрывал факт не реже `level`.
+    """
+    c = daily["Close"]
+    vol = np.log(c).diff().rolling(20).std()
+    y = np.log((daily["Open"] if target == "open" else c).shift(-1) / c)
+    z = y / vol
+    if skip_target_days is not None:
+        nxt = pd.Series(daily.index, index=daily.index).shift(-1)
+        z[nxt.isin(pd.to_datetime(list(skip_target_days))).to_numpy()] = np.nan
+    hist = z.dropna()
+    best = None
+    for q in np.arange((1 - level) / 2, 0.019, -0.01):
+        lo = hist.rolling(window, min_periods=60).quantile(q).shift()
+        hi = hist.rolling(window, min_periods=60).quantile(1 - q).shift()
+        ok = ((hist >= lo) & (hist <= hi))[lo.notna()].iloc[-window:]
+        best = {"q": float(q), "coverage": float(ok.mean()) if len(ok) else float("nan"), "n": int(len(ok))}
+        if len(ok) < 60 or ok.mean() >= level:
+            break
+    recent, v = hist.iloc[-window:], float(vol.iloc[-1])
+    return {**best, "lo": float(recent.quantile(best["q"]) * v), "hi": float(recent.quantile(1 - best["q"]) * v),
+            "level": level}
 
 # Модель и сетка гиперпараметров, которые перебираются при обучении.
 CANDIDATES = {
@@ -72,7 +108,7 @@ class Ensemble:
 
     def fit(self, X, y):
         for name, p in self.params.items():
-            self.models[name] = clone(CANDIDATES[name][0]).set_params(**p).fit(X, y)
+            self.models[name] = clone(CANDIDATES[name][0]).set_params(**p).fit(X, _clip(y))
         for name, c in _classifiers().items():
             self.classifiers[name] = c.fit(X, (y > 0).astype(int))
         return self
@@ -97,7 +133,7 @@ def tune(X: pd.DataFrame, y: pd.Series, n_splits: int = 4, fast: bool = False) -
         for p in combos:
             errs = []
             for tr, va in cv.split(X):
-                m = clone(base).set_params(**p).fit(X.iloc[tr], y.iloc[tr])
+                m = clone(base).set_params(**p).fit(X.iloc[tr], _clip(y.iloc[tr]))
                 errs.append(np.mean(np.abs(m.predict(X.iloc[va]) - y.iloc[va])))
             scores.append(np.mean(errs))
         i = int(np.argmin(scores))
@@ -160,7 +196,8 @@ def walk_forward(features: pd.DataFrame, params: dict, weights: dict, test_days:
     }
 
 
-def predict_next(features: pd.DataFrame, last_close: float, backtest_days: int = 250, fast: bool = False) -> Prediction:
+def predict_next(features: pd.DataFrame, last_close: float, backtest_days: int = 250, fast: bool = False,
+                 interval: dict | None = None) -> Prediction:
     train = features.dropna()
     X, y = train.drop(columns="target"), train["target"]
     x_last = features.drop(columns="target").iloc[[-1]].ffill().fillna(0)
@@ -172,8 +209,11 @@ def predict_next(features: pd.DataFrame, last_close: float, backtest_days: int =
     ens = Ensemble(params, weights).fit(X, y)
     point = ens.predict_all(x_last)
     r = float(point["ensemble"][0])
-    q = {qq: float(_quantile_model(qq).fit(X, y).predict(x_last)[0]) for qq in QUANTILES}
-    lo, hi = min(q[QUANTILES[0]], r), max(q[QUANTILES[1]], r)
+    if interval:  # откалиброванный диапазон (calibrated_range)
+        lo, hi = min(interval["lo"], r), max(interval["hi"], r)
+    else:
+        q = {qq: float(_quantile_model(qq).fit(X, y).predict(x_last)[0]) for qq in QUANTILES}
+        lo, hi = min(q[QUANTILES[0]], r), max(q[QUANTILES[1]], r)
     prob_up = float(ens.prob_up(x_last)[0])
 
     imp = pd.Series(0.0, index=X.columns)
@@ -182,6 +222,8 @@ def predict_next(features: pd.DataFrame, last_close: float, backtest_days: int =
     imp = (imp / imp.sum()).sort_values(ascending=False).head(10)
 
     bt = walk_forward(features, params, weights, test_days=backtest_days)
+    if interval:
+        bt["interval_coverage"], bt["interval_days"] = interval["coverage"], interval["n"]
     return Prediction(
         last_date=str(features.index[-1].date()),
         last_close=last_close,
@@ -199,3 +241,50 @@ def predict_next(features: pd.DataFrame, last_close: float, backtest_days: int =
         n_features=X.shape[1],
         n_train_days=len(X),
     )
+
+
+def replay(daily: pd.DataFrame, close_feats: pd.DataFrame, open_feats: pd.DataFrame,
+           days: int = 10, fast: bool = False, skip_target_days: list | None = None) -> pd.DataFrame:
+    """Модель «как будто» запускали каждый вечер последние `days` торговых дней.
+
+    Для каждого дня t модель учится только на том, что было известно к закрытию t,
+    и предсказывает открытие и закрытие t+1. Гиперпараметры подбираются один раз
+    на данных до начала окна — без заглядывания в будущее.
+    """
+    idx = daily.index
+    days = min(days, len(idx) - 2)
+    start = idx[len(idx) - days - 1]
+    setups = {}
+    for name, f in (("close", close_feats), ("open", open_feats)):
+        data = f.loc[:start].iloc[:-1].dropna()
+        X, y = data.drop(columns="target"), data["target"]
+        setups[name] = (f,) + tune(X, y, fast=fast)[:2]
+
+    rows = []
+    for i in range(len(idx) - days - 1, len(idx) - 1):
+        t, nxt = idx[i], idx[i + 1]
+        prev = float(daily["Close"].iloc[i])
+        row = {"date": nxt, "prev_close": prev,
+               "open": float(daily["Open"].iloc[i + 1]), "close": float(daily["Close"].iloc[i + 1])}
+        for name, (f, params, weights) in setups.items():
+            # Строка t содержит цель t+1 (будущее) — в обучение не берём.
+            train = f.loc[:t].iloc[:-1].dropna()
+            X, y = train.drop(columns="target"), train["target"]
+            x_t = f.drop(columns="target").loc[:t].iloc[[-1]].ffill().fillna(0)
+            ens = Ensemble(params, weights).fit(X, y)
+            r = float(ens.predict_all(x_t)["ensemble"][0])
+            rng = calibrated_range(daily.iloc[: i + 1], name, skip_target_days=skip_target_days)
+            lo, hi = rng["lo"], rng["hi"]
+            row[f"pred_{name}"] = prev * np.exp(r)
+            row[f"{name}_lo"] = prev * np.exp(min(lo, r))
+            row[f"{name}_hi"] = prev * np.exp(max(hi, r))
+            if name == "close":
+                row["prob_up"] = float(ens.prob_up(x_t)[0])
+        rows.append(row)
+    out = pd.DataFrame(rows).set_index("date")
+    for name in ("open", "close"):
+        out[f"{name}_err"] = out[name] / out[f"pred_{name}"] - 1
+        out[f"{name}_in_range"] = (out[name] >= out[f"{name}_lo"]) & (out[name] <= out[f"{name}_hi"])
+    out["naive_close_err"] = out["close"] / out["prev_close"] - 1
+    out["dir_hit"] = np.sign(out["pred_close"] - out["prev_close"]) == np.sign(out["close"] - out["prev_close"])
+    return out

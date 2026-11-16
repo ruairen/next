@@ -11,7 +11,7 @@ import pandas as pd
 from . import data
 from .features import build_features, intraday_summary, score_news
 from . import events
-from .model import predict_next
+from .model import calibrated_range, predict_next, replay
 from .report import events_html, events_text, html_report, text_report
 
 
@@ -27,8 +27,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true", help="показывать ход обучения")
     ap.add_argument("--demo", action="store_true", help="синтетические данные, без интернета")
     ap.add_argument("--prices-csv", help="свои дневные цены (Date,Open,High,Low,Close,Volume)")
+    ap.add_argument("--context-csv", help="свои цены рынка/конкурентов (Date + колонка на тикер), без загрузки")
     ap.add_argument("--news-csv", help="свои новости (time,title[,summary])")
     ap.add_argument("--out", default="output", help="папка для отчётов")
+    ap.add_argument("--replay", type=int, metavar="N",
+                    help="переиграть последние N дней: что модель предсказала бы каждый вечер, и сравнить с фактом")
     ap.add_argument("--earnings-day", action="store_true",
                     help="следующая сессия — день после отчёта компании (определяется и автоматически)")
     ap.add_argument("--after-hours", type=float, metavar="PRICE",
@@ -48,17 +51,27 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             logging.warning("Минутные сделки недоступны: %s", exc)
             intraday = pd.DataFrame()
-        context = data.fetch_context(context_tickers, args.years) if context_tickers else pd.DataFrame()
+        if args.context_csv:
+            context = pd.read_csv(args.context_csv, index_col=0, parse_dates=True)
+            context = context[[c for c in context.columns if c in context_tickers]] if context_tickers else pd.DataFrame()
+        else:
+            context = data.fetch_context(context_tickers, args.years) if context_tickers else pd.DataFrame()
 
     news = score_news(news)
-    features = build_features(daily, news, context)
+    # Даты отчётов известны только для NXT: эти дни исключаются из обучения обычной модели.
+    skip = events.EARNINGS_REACTION_DAYS if args.ticker.upper() == "NXT" else None
+    features = build_features(daily, news, context, skip_target_days=skip)
+    open_features = build_features(daily, news, context, target="open", skip_target_days=skip)
+    if args.replay:
+        return run_replay(args, daily, features, open_features, skip)
     print(f"Обучение на {len(features.dropna())} днях, {features.shape[1] - 1} признаков"
           f"{' (быстрый режим)' if args.fast else ', подбор гиперпараметров'}...", flush=True)
     last_close = float(daily["Close"].iloc[-1])
-    pred = predict_next(features, last_close=last_close, backtest_days=args.backtest_days, fast=args.fast)
+    pred = predict_next(features, last_close=last_close, backtest_days=args.backtest_days, fast=args.fast,
+                        interval=calibrated_range(daily, "close", skip_target_days=skip))
     print("Прогноз цены открытия...", flush=True)
-    pred_open = predict_next(build_features(daily, news, context, target="open"), last_close=last_close,
-                             backtest_days=args.backtest_days, fast=args.fast)
+    pred_open = predict_next(open_features, last_close=last_close, backtest_days=args.backtest_days, fast=args.fast,
+                             interval=calibrated_range(daily, "open", skip_target_days=skip))
     intra = intraday_summary(intraday)
 
     next_day = daily.index[-1].normalize() + pd.offsets.BDay()
@@ -98,6 +111,28 @@ def main(argv: list[str] | None = None) -> int:
         }
     (out / f"{args.ticker}_prediction.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nОтчёт: {out / f'{args.ticker}_report.html'}")
+    return 0
+
+
+def run_replay(args, daily: pd.DataFrame, close_feats: pd.DataFrame, open_feats: pd.DataFrame, skip=None) -> int:
+    print(f"Переигрываю последние {args.replay} дней (модель каждый вечер учится только на прошлом)...", flush=True)
+    r = replay(daily, close_feats, open_feats, days=args.replay, fast=args.fast, skip_target_days=skip)
+    print(f"\n=== {args.ticker}: переигровка последних {len(r)} дней ===")
+    print(f"{'день':10s} {'закр.накануне':>13s} | {'откр.прогн':>10s} {'факт':>7s} {'ошибка':>7s} | "
+          f"{'закр.прогн':>10s} {'факт':>7s} {'ошибка':>7s} {'P(рост)':>7s} {'напр.':>5s}")
+    for d, x in r.iterrows():
+        print(f"{d:%Y-%m-%d} {x.prev_close:13.2f} | {x.pred_open:10.2f} {x.open:7.2f} {x.open_err * 100:+6.1f}%"
+              f"{'' if x.open_in_range else '!'} | {x.pred_close:10.2f} {x.close:7.2f} {x.close_err * 100:+6.1f}%"
+              f"{'' if x.close_in_range else '!'} {x.prob_up:7.0%} {'✓' if x.dir_hit else '✗':>5s}")
+    print(f"\nСредняя ошибка: открытие {r.open_err.abs().mean() * 100:.2f}%, закрытие {r.close_err.abs().mean() * 100:.2f}%"
+          f" (у «цена не изменится» {r.naive_close_err.abs().mean() * 100:.2f}%)")
+    print(f"Факт внутри диапазона 80%: открытие {r.open_in_range.mean():.0%}, закрытие {r.close_in_range.mean():.0%};"
+          f" направление угадано {r.dir_hit.mean():.0%} ({int(r.dir_hit.sum())} из {len(r)})")
+    print("! — факт вне диапазона 80%")
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    r.to_csv(out / f"{args.ticker}_replay.csv")
+    print(f"\nТаблица: {out / f'{args.ticker}_replay.csv'}")
     return 0
 
 

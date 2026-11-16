@@ -42,6 +42,8 @@ def text_report(ticker: str, p: Prediction, intraday: dict, news: pd.DataFrame, 
         f"  угадано направление: регрессия {bt['direction_accuracy']:.0%}, классификатор {bt['classifier_accuracy']:.0%}"
         f" (доля дней роста {bt['share_up_days']:.0%})",
         f"  Brier вероятности роста: {bt['brier']:.4f} vs {bt['brier_naive']:.4f} у константы (меньше — лучше)",
+        *([f"  диапазон 80% накрыл факт в {bt['interval_coverage']:.0%} из последних {bt['interval_days']} дней"]
+          if "interval_coverage" in bt else []),
         f"  вердикт: {verdict(bt)}",
         "",
         f"Обучено на {p.n_train_days} днях, {p.n_features} признаков. Модели (вес · прогноз):",
@@ -117,6 +119,8 @@ def html_report(
         f"<td class='s'>{html.escape(str(p.params[k] or 'по умолчанию'))}</td></tr>"
         for k in p.weights
     )
+    cov = (f"<p>Диапазон 80% откалиброван по волатильности: на последних {bt['interval_days']} днях он накрыл факт в "
+           f"<b>{bt['interval_coverage']:.0%}</b> случаев.</p>") if "interval_coverage" in bt else ""
     feats = "".join(f"<li>{html.escape(k)} <span class='s'>{v:.1%}</span></li>" for k, v in p.top_features)
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{ticker} прогноз цены</title>
@@ -139,7 +143,7 @@ td:first-child{{white-space:nowrap;color:var(--muted)}} ul{{padding-left:18px}}
 {open_card}
 <div class="card"><div class="k">Прогноз закрытия</div><div class="v {sign}">${p.predicted_price:.2f}</div><div class="s {sign}">{p.predicted_return * 100:+.2f}% к ${p.last_close:.2f}</div></div>
 <div class="card"><div class="k">Диапазон 80%</div><div class="v">${p.low_price:.0f}–{p.high_price:.0f}</div><div class="s">${p.low_price:.2f} – ${p.high_price:.2f}</div></div>
-<div class="card"><div class="k">Вероятность роста</div><div class="v">{p.prob_up:.0%}</div><div class="s">по ошибкам модели</div></div>
+<div class="card"><div class="k">Вероятность роста</div><div class="v">{p.prob_up:.0%}</div><div class="s">по классификаторам</div></div>
 {trade}
 </div>
 {_svg_chart(daily["Close"].tail(90), p)}
@@ -148,6 +152,7 @@ td:first-child{{white-space:nowrap;color:var(--muted)}} ul{{padding-left:18px}}
 против <b>{bt['mae_naive'] * 100:.2f}%</b> у наивного прогноза «цена не изменится».
 Направление угадано в <b>{bt['direction_accuracy']:.0%}</b> случаев регрессией и в <b>{bt['classifier_accuracy']:.0%}</b>
 классификатором (доля дней роста — {bt['share_up_days']:.0%}).</p>
+{cov}
 <p><b>Вердикт:</b> {html.escape(verdict(bt))}.</p>
 <h2>Модели ансамбля</h2>
 <div class="s">Обучено на {p.n_train_days} днях, {p.n_features} признаков. Гиперпараметры подобраны на данных до периода проверки.</div>

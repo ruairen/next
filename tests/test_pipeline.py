@@ -177,3 +177,42 @@ def test_cli_earnings_day_with_after_hours(tmp_path):
     summary = json.loads((tmp_path / "NXT_prediction.json").read_text(encoding="utf-8"))
     assert summary["earnings_day"]["after_hours"]["pct"] > 0.04
     assert "Реакция на отчёты компании" in (tmp_path / "NXT_report.html").read_text(encoding="utf-8")
+
+
+def test_sparse_news_not_used_as_features():
+    daily, _, news = data.synthetic_data(days=300)
+    assert "news_sent" in build_features(daily, news).columns
+    assert "news_sent" not in build_features(daily, news.tail(3)).columns
+
+
+def test_skip_target_days_removes_those_targets():
+    daily, _, _ = data.synthetic_data(days=120)
+    skip = [daily.index[50], daily.index[80]]
+    f = build_features(daily, skip_target_days=skip)
+    assert np.isnan(f["target"].iloc[49]) and np.isnan(f["target"].iloc[79])
+    assert not np.isnan(f["target"].iloc[50])
+
+
+def test_calibrated_range_reaches_target_coverage():
+    from nxt_predictor.model import calibrated_range
+
+    daily, _, _ = data.synthetic_data(days=900)
+    r = calibrated_range(daily, "close")
+    assert r["lo"] < 0 < r["hi"]
+    assert r["coverage"] >= 0.78 and r["n"] == 250
+    ro = calibrated_range(daily, "open")
+    assert ro["lo"] < 0 < ro["hi"]
+
+
+def test_replay_uses_only_past_and_reports_errors():
+    from nxt_predictor.model import replay
+
+    daily, _, _ = data.synthetic_data(days=220)
+    r = replay(daily, build_features(daily), build_features(daily, target="open"), days=2, fast=True)
+    assert list(r.index) == list(daily.index[-2:])
+    assert np.allclose(r["close"], daily["Close"].iloc[-2:])
+    assert (r["close_lo"] <= r["pred_close"]).all() and (r["pred_close"] <= r["close_hi"]).all()
+    # прогноз на предпоследний день не меняется, если убрать из данных последний день
+    r2 = replay(daily.iloc[:-1], build_features(daily.iloc[:-1]), build_features(daily.iloc[:-1], target="open"),
+                days=1, fast=True)
+    assert abs(r2["pred_close"].iloc[0] - r["pred_close"].iloc[0]) < 1e-9
