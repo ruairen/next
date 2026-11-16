@@ -1,0 +1,53 @@
+WARNING: Новости Yahoo недоступны: Failed to perform, curl: (7) CONNECT tunnel failed, response 403. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+Обучение на 884 днях, 59 признаков, подбор гиперпараметров...
+INFO: ridge: MAE 0.0263, параметры {}
+INFO: gbm: MAE 0.0276, параметры {'learning_rate': 0.01, 'max_depth': 2, 'n_estimators': 150}
+INFO: hgb: MAE 0.0262, параметры {'l2_regularization': 0.0, 'learning_rate': 0.02, 'max_depth': 2, 'max_iter': 150}
+INFO: rf: MAE 0.0264, параметры {'max_depth': 8, 'min_samples_leaf': 20}
+INFO: et: MAE 0.0263, параметры {'max_depth': 4, 'min_samples_leaf': 20}
+Прогноз цены открытия...
+INFO: ridge: MAE 0.0140, параметры {}
+INFO: gbm: MAE 0.0141, параметры {'learning_rate': 0.01, 'max_depth': 2, 'n_estimators': 150}
+INFO: hgb: MAE 0.0139, параметры {'l2_regularization': 1.0, 'learning_rate': 0.02, 'max_depth': 2, 'max_iter': 150}
+INFO: rf: MAE 0.0140, параметры {'max_depth': 4, 'min_samples_leaf': 20}
+INFO: et: MAE 0.0139, параметры {'max_depth': 4, 'min_samples_leaf': 20}
+=== NXT: прогноз на следующую торговую сессию ===
+Последнее закрытие (2026-11-13): $95.03
+Последняя сделка (2026-11-13 15:59:00): $95.07, VWAP $94.26, давление покупок 49%
+Прогноз открытия: $95.25  +0.23%  (80%: $93.12 – $96.87; на истории ошибка 1.74% vs 1.75% у «открытие = вчерашнее закрытие»)
+Прогноз закрытия: $94.65  ▼ -0.40%
+Диапазон 80%:     $90.65 – $99.02
+Вероятность роста: 58%
+
+Проверка на истории (250 дней, walk-forward):
+  средняя ошибка модели 3.27% vs «цена не изменится» 3.30%
+  угадано направление: регрессия 58%, классификатор 60% (доля дней роста 50%)
+  Brier вероятности роста: 0.2442 vs 0.2500 у константы (меньше — лучше)
+  вердикт: модель лишь немного лучше наивного прогноза (1.1%) — относитесь осторожно
+
+Обучено на 884 днях, 59 признаков. Модели (вес · прогноз):
+  ridge  20.4% · +0.05%  параметры по умолчанию
+  gbm    18.4% · -0.38%  параметры {'learning_rate': 0.01, 'max_depth': 2, 'n_estimators': 150}
+  hgb    20.5% · -0.61%  параметры {'l2_regularization': 0.0, 'learning_rate': 0.02, 'max_depth': 2, 'max_iter': 150}
+  rf     20.3% · -0.78%  параметры {'max_depth': 8, 'min_samples_leaf': 20}
+  et     20.3% · -0.27%  параметры {'max_depth': 4, 'min_samples_leaf': 20}
+
+Самые важные признаки: volume_z, fslr_ret_1, low_52w, range, high_52w
+
+Последние новости:
+  [+0.00] 2026-11-15 Nextpower Inc. (NXT) stock price, news, quote and history - Yahoo Finance Singapore
+  [+0.00] 2026-11-14 Nextpower Inc. (NXT) stock price, news, quote and history - Yahoo Finance UK
+  [+0.57] 2026-11-14 Nextpower (NXT) Expands Beyond Solar Trackers as Backlog Tops $6 Billion - Yahoo Finance
+  [+0.10] 2026-11-14 Nextpower (NXT) Expands Its RE+ 2026 Push, Is The Stock Still Cheap? - Simply Wall St
+  [+0.42] 2026-11-14 The future of U.S. renewable energy rests on Nextpower—the backbone of the growing solar sector - Fortune
+  [+0.38] 2026-11-13 Nextpower Stock In Focus As Lifecycle Services Expand - Yahoo! Finance Canada
+  [+0.30] 2026-11-13 NextDC (ASX:NXT) Shares in Focus: Why Is the ASX 50 Stock Drawing Attention? - Kalkine Media
+  [+0.00] 2026-11-12 Nextpower to Showcase Expanded Power Technology and Services Platform at RE+ 2026 - Yahoo Finance
+
+Это статистическая оценка, а не инвестиционная рекомендация.
+
+=== Особенности дня 2026-11-16 ===
+  обычный день календаря
+  календарные эффекты NXT статистически не доказаны (все p ≥ 0.05) — модель их не учитывает
+
+Отчёт: reports/2026-11-16/NXT_report.html
